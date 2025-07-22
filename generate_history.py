@@ -10,7 +10,7 @@ warnings.filterwarnings('ignore', category=UserWarning, module='pandas_ta')
 # --- Параметры ---
 CONFIG_FILE       = 'config.json'
 OUTPUT_FILE       = 'full_history_with_indicators.csv'
-HISTORY_LIMIT     = 10000
+HISTORY_LIMIT     = 5000
 
 # Настройки индикаторов
 ATR_LENGTH        = 14
