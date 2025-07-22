@@ -1,0 +1,23 @@
+{
+    "symbols": [
+        "BTC/USDT",
+        "ETH/USDT",
+        "BNB/USDT",
+        "SOL/USDT",
+        "XRP/USDT",
+        "CAKE/USDT",
+        "DOGE/USDT",
+        "MEME/USDT",
+        "WIF/USDT",
+        "POPCAT/USDT",
+        "LINK/USDT",
+        "ALGO/USDT",
+        "ZRX/USDT",
+        "OP/USDT",
+        "LDO/USDT"
+    ],
+    "timeframe": "5m",
+    "monitoring_interval_seconds": 60,
+    "min_signal_strength": 3,
+    "filter_threshold": 0.5  
+}
