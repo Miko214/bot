@@ -1,1 +1,6 @@
 /venv
+/models
+expert_trades.csv
+full_history_with_indicators.csv
+training_dataset.csv
+

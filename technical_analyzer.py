@@ -4,7 +4,7 @@ import pandas as pd
 import pandas_ta as ta
 import time
 # ИСПРАВЛЕНО: Правильный импорт для datetime.strptime
-from datetime import datetime, timezone
+from datetime import datetime
 import numpy as np
 import logging
 import json
@@ -19,14 +19,13 @@ warnings.filterwarnings(
     message="X does not have valid feature names*",
     category=UserWarning
 )
-warnings.filterwarnings(
-    "ignore",
-    message="Converting to PeriodArray/Index representation will drop timezone information.",
-    category=UserWarning
-)
 
 # --- НОВАЯ ФУНКЦИЯ ДЛЯ ЗАГРУЗКИ ПОСЛЕДНЕЙ МОДЕЛИ (ИСПРАВЛЕНО) ---
 def load_latest_model():
+    """
+    Ищет в папке 'models' файлы trade_model_*.pkl,
+    извлекает метку времени из имени файла и загружает самый свежий.
+    """
     model_dir = "models"
     pattern = "trade_model_*.pkl"
     files = glob.glob(os.path.join(model_dir, pattern))
@@ -34,29 +33,35 @@ def load_latest_model():
         raise FileNotFoundError(f"В папке '{model_dir}' нет ни одного файла '{pattern}'")
 
     latest_file = None
-    latest_timestamp_dt = None
+    latest_timestamp_dt = None # Храним объект datetime для сравнения
 
-    timestamp_pattern = re.compile(r"trade_model_(\d{8}_\d{4})\.pkl")
+    # Регулярное выражение для извлечения метки времени из имени файла
+    # Например: trade_model_20250710_1441.pkl -> "20250710_1441"
+    timestamp_pattern = re.compile(r"trade_model_(\d{8}_\d{4})\.pkl$")
 
     for f in files:
-        match = timestamp_pattern.search(f)
+        base_name = os.path.basename(f)
+        match = timestamp_pattern.search(base_name)
         if match:
-            timestamp_str = match.group(1)
+            timestamp_str = match.group(1) # Получаем строку метки времени (например, "20250710_1441")
             try:
+                # Преобразуем строку в объект datetime для корректного сравнения
                 current_timestamp_dt = datetime.strptime(timestamp_str, "%Y%m%d_%H%M")
                 if latest_timestamp_dt is None or current_timestamp_dt > latest_timestamp_dt:
                     latest_timestamp_dt = current_timestamp_dt
                     latest_file = f
             except ValueError:
-                logger.warning(f"Некорректный формат метки времени в имени файла: {f}")
-                continue
-    
-    if latest_file:
-        logger.info(f"Loading latest model: {latest_file}")
-        mdl = joblib.load(latest_file) # ИСПРАВЛЕНО: использование latest_file
-        return mdl["model"], mdl["features"]
-    else:
-        raise FileNotFoundError(f"Не удалось найти корректный файл модели в '{model_dir}'")
+                logger.warning(f"Не удалось распарсить метку времени из имени файла: {f}. Игнорирую файл.")
+                continue # Пропускаем файлы с некорректными метками времени
+        else:
+            logger.warning(f"Имя файла '{f}' не соответствует ожидаемому шаблону 'trade_model_YYYYMMDD_HHMM.pkl'. Игнорирую файл.")
+
+    if latest_file is None:
+        raise FileNotFoundError(f"Не найдено валидных файлов модели в папке '{model_dir}' по шаблону '{pattern}' с корректной меткой времени в имени.")
+
+    logger.info(f"💾 Загружаю последнюю модель по метке времени в имени файла: {latest_file}")
+    mdl = joblib.load(latest_file)
+    return mdl["model"], mdl["features"]
 
 # --- Глобальные переменные для модели и признаков ---
 # Эти переменные будут инициализированы в initialize_bot
@@ -87,8 +92,6 @@ FILTER_THRESHOLD = 0.6 # Устанавливается из конфига
 EXCHANGE = None
 active_trades = {}  # Глобальный словарь для сделок
 
-HISTORY_LIMIT = 500 
-
 # --- НАСТРОЙКИ СТРАТЕГИИ ---
 ATR_LENGTH = 14
 MACD_FAST_LENGTH = 12
@@ -104,30 +107,16 @@ RSI_REVERSAL_LONG_THRESHOLD = 45 # поменять на 40
 RSI_REVERSAL_SHORT_THRESHOLD = 55 # поменять на 60
 MACD_REVERSAL_CONFIRMATION = True
 BB_MIDDLE_CROSS_ATR_BUFFER = 0.2
+BBW_EMA_LENGTH = 14 # Примерное значение, если не определено
+VOLUME_EMA_LENGTH = 20
+ADX_LENGTH = 14
 
 # --- НОВЫЕ НАСТРОЙКИ ДЛЯ ИНДИКАТОРОВ ---
-# Настройки индикаторов
-ATR_LENGTH = 14
-RSI_LENGTH = 14
-MACD_FAST_LENGTH = 12
-MACD_SLOW_LENGTH = 26
-MACD_SIGNAL_LENGTH = 9
-BB_LENGTH = 20
-BB_MULTIPLIER = 2.0
-EMA_SHORT = 50
-EMA_LONG = 200
-VOLUME_EMA_LENGTH = 20
+CMF_LENGTH = 20
+RVI_LENGTH = 14
 KAMA_LENGTH = 10
 KAMA_FAST_EMA_PERIOD = 2
 KAMA_SLOW_EMA_PERIOD = 30
-CMF_LENGTH = 20
-RVI_LENGTH = 14
-STOCH_LENGTH = 14
-STOCH_SMOOTH_K = 3
-STOCH_SMOOTH_D = 3
-ADX_LENGTH = 14 # <-- ДОБАВЬТЕ ЭТУ СТРОКУ
-CCI_LENGTH = 20
-VWAP_LENGTH = 14 # Хотя VWAP обычно не принимает length, добавим для полноты
 
 # --- КОНСТАНТЫ ДЛЯ ДИНАМИЧЕСКИХ SL/TP ---
 LOOKBACK_CANDLES_FOR_LEVELS = 20
@@ -247,131 +236,234 @@ def retry_on_exception(func, retries=3, delay=1, backoff=2):
     raise Exception(f"Все {retries} попыток исчерпаны. Не удалось выполнить функцию {func.__name__}.")
 
 
-def fetch_data(symbol: str) -> pd.DataFrame | None:
-    try:
-        ohlcv = EXCHANGE.fetch_ohlcv(symbol, TIMEFRAME, limit=5000) # Нужно больше для индикаторов
+def fetch_data(symbol):
+    """Загружает исторические данные (свечи) для конкретной пары с биржи."""
+    def _fetch():
+        ohlcv = EXCHANGE.fetch_ohlcv(symbol, TIMEFRAME, limit=5000)
         df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-        df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms', utc=True) # <-- ИСПРАВЛЕНО
-        df.set_index('timestamp', inplace=True)
-        return df
-    except ccxt.NetworkError as e:
-        logger.error(f"[{symbol}] Ошибка сети при получении данных: {e}")
-        return None
-    except Exception as e:
-        logger.error(f"[{symbol}] Ошибка при получении данных OHLCV: {e}", exc_info=True)
-        return None
-
-    except ccxt.NetworkError as e:
-        logger.error(f"[{symbol}] Ошибка сети при получении данных: {e}")
-        return None
-    except Exception as e:
-        logger.error(f"[{symbol}] Неизвестная ошибка при получении данных: {e}", exc_info=True)
-        return None
-
-
-def calculate_atr_manually(df, length):
-    """
-    Ручной расчет Average True Range (ATR).
-    Используется вместо pandas_ta.atr, чтобы избежать проблем с 'fillna'.
-    """
-    if df.empty:
+        df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
+        df[['open', 'high', 'low', 'close', 'volume']] = df[['open', 'high', 'low', 'close', 'volume']].astype(float)
         return df
 
+    try:
+        return retry_on_exception(_fetch, retries=5, delay=2)
+    except Exception as e:
+        logger.critical(f"[{symbol}] Критическая ошибка: Не удалось получить данные: {e}", exc_info=True)
+        return None
+
+
+def calculate_atr_manually(df, length=14):
+    """Расчет Average True Range (ATR) вручную."""
+    if len(df) < length + 1:
+        df[f'ATR_{length}'] = np.nan
+        return df
     high_low = df['high'] - df['low']
-    high_prev_close = abs(df['high'] - df['close'].shift(1))
-    low_prev_close = abs(df['low'] - df['close'].shift(1))
-
-    true_range = pd.DataFrame({'hl': high_low, 'hpc': high_prev_close, 'lpc': low_prev_close}).max(axis=1)
-    
-    # Расчет EMA для ATR
-    atr = true_range.ewm(span=length, adjust=False, min_periods=length).mean()
-    df[f'ATR_{length}'] = atr
+    high_close = np.abs(df['high'] - df['close'].shift())
+    low_close = np.abs(df['low'] - df['close'].shift())
+    tr = pd.DataFrame({'hl': high_low, 'hc': high_close, 'lc': low_close}).max(axis=1)
+    df[f'ATR_{length}'] = tr.ewm(span=length, adjust=False).mean()
     return df
 
 
-def add_indicators(df: pd.DataFrame, symbol: str) -> pd.DataFrame:
+def add_indicators(df, symbol):
+    """Добавляет технические индикаторы в DataFrame."""
     if df.empty:
+        print(f"[{symbol}] Входной DataFrame пуст. Возвращаю пустой DF.")
+        return df
+
+    df_copy = df.copy()
+    
+    # 1. Убедимся, что колонка 'timestamp' существует и является datetime
+    if 'timestamp' not in df_copy.columns:
+        print(f"[{symbol}] Ошибка: Колонка 'timestamp' отсутствует в DataFrame. Не могу установить DatetimeIndex.")
+        return pd.DataFrame()
+    
+    df_copy['timestamp'] = pd.to_datetime(df_copy['timestamp'], unit='ms', errors='coerce')
+    df_copy.dropna(subset=['timestamp'], inplace=True)
+    if df_copy.empty:
+        print(f"[{symbol}] WARNING: DataFrame пуст после очистки некорректных временных меток.")
         return pd.DataFrame()
 
-    # Убедимся, что timestamp является DatetimeIndex и в UTC
-    if not isinstance(df.index, pd.DatetimeIndex):
-        df.index = pd.to_datetime(df.index, utc=True)
-    elif df.index.tz is None: # Если индекс наивный, но должен быть UTC
-        df.index = df.index.tz_localize('UTC')
-    elif df.index.tz != timezone.utc: # Если индекс с другим часовым поясом, конвертируем
-        df.index = df.index.tz_convert('UTC')
+    # 2. Приводим все числовые колонки к float и удаляем бесконечности
+    for col in ['open', 'high', 'low', 'close', 'volume']:
+        if col in df_copy.columns:
+            df_copy[col] = pd.to_numeric(df_copy[col], errors='coerce')
+            # Исправлено: заменено inplace=True на прямое присваивание
+            df_copy[col] = df_copy[col].replace([np.inf, -np.inf], np.nan)
+            
+    # Дополнительная очистка NaNs в основных колонках, необходимых для расчетов
+    df_copy.dropna(subset=['open', 'high', 'low', 'close', 'volume'], inplace=True)
+    if df_copy.empty:
+        print(f"[{symbol}] WARNING: DataFrame пуст после очистки основных OHLCV данных.")
+        return pd.DataFrame()
 
-    # Добавляем временные признаки (убеждаемся, что df.index уже UTC)
-    df['hour_of_day'] = df.index.hour
-    df['day_of_week'] = df.index.dayofweek
-    df['day_of_month'] = df.index.day
-    df['month_of_year'] = df.index.month
-    df['is_weekend'] = ((df.index.dayofweek == 5) | (df.index.dayofweek == 6)).astype(int)
+    # 3. Установим 'timestamp' как индекс DataFrame и отсортируем
+    df_copy.set_index('timestamp', inplace=True)
+    df_copy.sort_index(inplace=True) 
 
-    # --- Ваш код для добавления всех индикаторов (как в generate_history.py) ---
-    # ATR
-    df.ta.atr(length=14, append=True)
+    required_cols = ['open', 'high', 'low', 'close', 'volume']
+    if not all(col in df_copy.columns for col in required_cols):
+        print(f"[{symbol}] Ошибка: Отсутствуют необходимые колонки ({', '.join(required_cols)}) для расчета индикаторов.")
+        df_copy.reset_index(inplace=True, drop=False)
+        return pd.DataFrame()
+
+    # --- РАСЧЕТ ИНДИКАТОРОВ ---
+
+    # ATR (рассчитывается вручную)
+    df_copy = calculate_atr_manually(df_copy, length=ATR_LENGTH)
+
     # EMA
-    df.ta.ema(length=50, append=True)
-    df.ta.ema(length=200, append=True)
+    df_copy.ta.ema(length=50, append=True, col_names=(f'EMA_50',))
+    df_copy.ta.ema(length=200, append=True, col_names=(f'EMA_200',))
     # RSI
-    df.ta.rsi(length=14, append=True)
+    df_copy.ta.rsi(length=14, append=True, col_names=(f'RSI_14',))
     # MACD
-    df.ta.macd(fast=12, slow=26, signal=9, append=True)
+    df_copy.ta.macd(fast=MACD_FAST_LENGTH, slow=MACD_SLOW_LENGTH, signal=MACD_SIGNAL_LENGTH, append=True)
     # Bollinger Bands
-    df.ta.bbands(close=df['close'], length=20, std=2.0, append=True)
-    df.rename(columns={
-        f'BBL_20_2.0': 'BB_lower',
-        f'BBM_20_2.0': 'BB_middle',
-        f'BBU_20_2.0': 'BB_upper',
-        f'BBB_20_2.0': 'BB_width'
-    }, inplace=True)
-    # VOLUME_EMA
-    df.ta.ema(close=df['volume'], length=20, append=True, col_names=(f'VOLUME_EMA',))
-    # KAMA
-    df.ta.kama(close=df['close'], length=10, fast=2, slow=30, append=True)
-    # CMF
-    df.ta.cmf(high=df['high'], low=df['low'], close=df['close'], volume=df['volume'], length=20, append=True)
-    # RVI
-    df.ta.rvi(close=df['close'], length=14, append=True)
-    # Stochastic Oscillator
-    df.ta.stoch(high=df['high'], low=df['low'], close=df['close'], k=14, d=3, append=True)
-    df.rename(columns={
-        f'STOCHk_14_3_3': 'STOCH_k',
-        f'STOCHd_14_3_3': 'STOCH_d'
-    }, inplace=True)
-    # ADX
-    df.ta.adx(length=14, append=True)
-    # CCI
-    df.ta.cci(length=20, append=True)
-    # VWAP
-    if 'volume' in df.columns and not df['volume'].isnull().all():
-        df.ta.vwap(append=True, fillna=True)
-
-
-    # Удаляем строки с NaN значениями, которые появились из-за индикаторов
-    # Список всех ожидаемых фичей, включая временные и переименованные BB/STOCH
-    expected_features_generated = [ # Имена фичей, которые add_indicators ГЕНЕРИРУЕТ
-        'hour_of_day', 'day_of_week', 'day_of_month', 'month_of_year', 'is_weekend',
-        'ATR_14', 'EMA_50', 'EMA_200', 'RSI_14',
-        'MACD_12_26_9', 'MACDh_12_26_9', 'MACDs_12_26_9',
-        'BB_upper', 'BB_middle', 'BB_lower', 'BB_width',
-        'VOLUME_EMA', 'KAMA_10_2_30', 'CMF_20', 'RVI_14',
-        'STOCH_k', 'STOCH_d', 'ADX_14', 'CCI_20'
-    ]
-    # VWAP_D - это дефолтное имя для VWAP в pandas_ta, если не указано другое
-    if 'VWAP_D' in df.columns:
-        expected_features_generated.append('VWAP_D')
-
-    # Для `dropna` используем все столбцы, которые могли быть сгенерированы.
-    required_for_dropna = [col for col in expected_features_generated if col in df.columns]
+    df_copy.ta.bbands(length=BB_LENGTH, std=BB_MULTIPLIER, append=True)
     
-    initial_rows = len(df)
-    df.dropna(subset=required_for_dropna, inplace=True)
-    #if len(df) < initial_rows:
-        #logger.warning(f"[{symbol}] Удалено {initial_rows - len(df)} строк из-за NaN в индикаторах.")
+    # Переименовываем колонки BBands
+    bb_upper_col = f'BBU_{BB_LENGTH}_{BB_MULTIPLIER}'
+    bb_middle_col = f'BBM_{BB_LENGTH}_{BB_MULTIPLIER}'
+    bb_lower_col = f'BBL_{BB_LENGTH}_{BB_MULTIPLIER}'
+    
+    if all(col in df_copy.columns for col in [bb_upper_col, bb_middle_col, bb_lower_col]):
+        df_copy.rename(columns={
+            bb_upper_col: 'BB_upper',
+            bb_middle_col: 'BB_middle',
+            bb_lower_col: 'BB_lower'
+        }, inplace=True)
+    else:
+        print(f"[{symbol}] WARNING: Не все колонки BBands найдены для переименования.")
+        for col in ['BB_upper', 'BB_middle', 'BB_lower']:
+            if col not in df_copy.columns:
+                df_copy[col] = np.nan
 
-    return df
+    # Расчет BB_width
+    df_copy['BB_width'] = (df_copy['BB_upper'] - df_copy['BB_lower']) / df_copy['BB_middle'].replace(0, np.nan)
+    df_copy['BB_width'] = df_copy['BB_width'].replace([np.inf, -np.inf], np.nan)
+
+    # BBW EMA
+    bbw_col_name = 'BB_width' 
+    bbw_ema_col_name = f'BBW_EMA_{BBW_EMA_LENGTH}'
+    if bbw_col_name in df_copy.columns and not df_copy[bbw_col_name].isnull().all():
+        df_copy[bbw_ema_col_name] = df_copy[bbw_col_name].ewm(span=BBW_EMA_LENGTH, adjust=False).mean()
+    else:
+        print(f"[{symbol}] WARNING: 'BB_width' не содержит данных для расчета BBW_EMA. Колонка '{bbw_ema_col_name}' будет NaN.")
+        df_copy[bbw_ema_col_name] = np.nan # Убедимся, что колонка существует
+
+    # Volume EMA
+    volume_ema_col_name = 'VOLUME_EMA' 
+    if 'volume' in df_copy.columns and not df_copy['volume'].isnull().all():
+        df_copy[volume_ema_col_name] = df_copy['volume'].ewm(span=VOLUME_EMA_LENGTH, adjust=False).mean()
+    else:
+        print(f"[{symbol}] WARNING: 'volume' колонка отсутствует или пуста. Не могу рассчитать VOLUME_EMA.")
+        df_copy[volume_ema_col_name] = np.nan # Убедимся, что колонка существует
+    
+    # Chaikin Money Flow (CMF)
+    if 'volume' in df_copy.columns and not (df_copy['volume'].isnull().all() or (df_copy['volume'] == 0).all()):
+        df_copy.ta.cmf(length=CMF_LENGTH, append=True, col_names=(f'CMF_{CMF_LENGTH}',))
+    else:
+        print(f"[{symbol}] WARNING: Объем отсутствует или равен нулю, CMF не будет рассчитан.")
+        
+    cmf_col = f'CMF_{CMF_LENGTH}'
+    if cmf_col not in df_copy.columns:
+        df_copy[cmf_col] = np.nan
+        print(f"[{symbol}] WARNING: Колонка '{cmf_col}' не была создана pandas_ta. Добавлена с NaN.")
+    
+    # Relative Volatility Index (RVI)
+    df_copy.ta.rvi(length=RVI_LENGTH, append=True, col_names=(f'RVI_{RVI_LENGTH}',))
+    rvi_col = f'RVI_{RVI_LENGTH}'
+    if rvi_col not in df_copy.columns:
+        df_copy[rvi_col] = np.nan
+        print(f"[{symbol}] WARNING: Колонка '{rvi_col}' не была создана pandas_ta. Добавлена с NaN.")
+    
+    # Kaufman's Adaptive Moving Average (KAMA)
+    df_copy.ta.kama(length=KAMA_LENGTH, fast=KAMA_FAST_EMA_PERIOD, slow=KAMA_SLOW_EMA_PERIOD, append=True, col_names=(f'KAMA_{KAMA_LENGTH}_{KAMA_FAST_EMA_PERIOD}_{KAMA_SLOW_EMA_PERIOD}',))
+    kama_col = f'KAMA_{KAMA_LENGTH}_{KAMA_FAST_EMA_PERIOD}_{KAMA_SLOW_EMA_PERIOD}'
+    if kama_col not in df_copy.columns:
+        df_copy[kama_col] = np.nan
+        print(f"[{symbol}] WARNING: Колонка '{kama_col}' не была создана pandas_ta. Добавлена с NaN.")
+
+    # # Stochastic Oscillator (STOCH) - УДАЛЕНО
+    # # Проверяем, есть ли вариации в high/low, иначе Stoch будет NaN
+    # if (df_copy['high'] == df_copy['low']).all():
+    #     print(f"[{symbol}] WARNING: Цены не меняются (High == Low). Стохастик не будет рассчитан.")
+    #     df_copy['STOCH_k'] = np.nan
+    #     df_copy['STOCH_d'] = np.nan
+    # else:
+    #     df_copy.ta.stoch(k=STOCH_K_LENGTH, d=STOCH_D_LENGTH, append=True)
+    #     stoch_k_col_name = f'STOCHk_{STOCH_K_LENGTH}_{STOCH_D_LENGTH}'
+    #     stoch_d_col_name = f'STOCHd_{STOCH_K_LENGTH}_{STOCH_D_LENGTH}'
+    #     if stoch_k_col_name in df_copy.columns and stoch_d_col_name in df_copy.columns:
+    #         df_copy.rename(columns={stoch_k_col_name: 'STOCH_k', stoch_d_col_name: 'STOCH_d'}, inplace=True)
+    #     else:
+    #         print(f"[{symbol}] WARNING: Стохастик ({stoch_k_col_name}, {stoch_d_col_name}) не был рассчитан. Возможно, недостаточно данных.")
+    #         df_copy['STOCH_k'] = np.nan
+    #         df_copy['STOCH_d'] = np.nan
+    
+    # Average Directional Index (ADX)
+    df_copy.ta.adx(length=ADX_LENGTH, append=True)
+    adx_col_name = f'ADX_{ADX_LENGTH}'
+    if adx_col_name in df_copy.columns:
+        df_copy.rename(columns={adx_col_name: 'ADX_14'}, inplace=True)
+    else:
+        print(f"[{symbol}] WARNING: ADX ({adx_col_name}) не был рассчитан. Возможно, недостаточно данных.")
+        df_copy['ADX_14'] = np.nan
+
+    # # Commodity Channel Index (CCI) - УДАЛЕНО
+    # # CCI также чувствителен к "плоским" свечам
+    # if (df_copy['high'] == df_copy['low']).all():
+    #     print(f"[{symbol}] WARNING: Цены не меняются (High == Low). CCI не будет рассчитан.")
+    #     df_copy['CCI_20'] = np.nan
+    # else:
+    #     df_copy.ta.cci(length=CCI_LENGTH, append=True)
+    #     cci_col_name = f'CCI_{CCI_LENGTH}'
+    #     if cci_col_name in df_copy.columns:
+    #         df_copy.rename(columns={cci_col_name: 'CCI_20'}, inplace=True)
+    #     else:
+    #         print(f"[{symbol}] WARNING: CCI ({cci_col_name}) не был рассчитан. Возможно, недостаточно данных.")
+    #         df_copy['CCI_20'] = np.nan
+
+    # # Volume Weighted Average Price (VWAP) - УДАЛЕНО
+    # # VWAP критически зависит от объема.
+    # if 'volume' in df_copy.columns and not (df_copy['volume'].isnull().all() or (df_copy['volume'] == 0).all()):
+    #     try:
+    #         df_copy.ta.vwap(append=True)
+    #         df_copy.rename(columns={'VWAP': 'VWAP_14'}, inplace=True) # pandas_ta.vwap() не использует length
+    #     except Exception as e:
+    #         print(f"[{symbol}] WARNING: Ошибка при расчете VWAP: {e}. Возможно, недостаточно данных или проблемы с индексом/данными.")
+    #         df_copy['VWAP_14'] = np.nan
+    # else:
+    #     print(f"[{symbol}] WARNING: Объем отсутствует или равен нулю, VWAP не будет рассчитан.")
+    #     if 'VWAP_14' not in df_copy.columns: # Убедимся, что колонка существует
+    #         df_copy['VWAP_14'] = np.nan
+
+    # --- ЗАПОЛНЕНИЕ NaN для всех индикаторов ---
+    # Исправлено: заменено inplace=True на прямое присваивание
+    for col in df_copy.columns:
+        if df_copy[col].dtype == 'float64' and df_copy[col].isnull().any():
+            df_copy[col] = df_copy[col].fillna(0)
+
+    # --- ЗАВЕРШАЮЩИЕ ШАГИ ---
+    # Вернуть 'timestamp' как обычную колонку
+    df_copy.reset_index(inplace=True, drop=False) 
+
+    # Финальная проверка на NaN.
+    initial_rows_before_final_dropna = len(df_copy)
+    df_copy.dropna(inplace=True) 
+    final_rows_after_final_dropna = len(df_copy)
+
+    if final_rows_after_final_dropna == 0:
+        print(f"[{symbol}] CRITICAL: DataFrame пуст после финальной очистки, несмотря на попытки заполнения NaN. Это серьезная проблема с данными.")
+        return pd.DataFrame()
+    elif final_rows_after_final_dropna < initial_rows_before_final_dropna:
+        print(f"[{symbol}] WARNING: После финальной очистки удалено {initial_rows_before_final_dropna - final_rows_after_final_dropna} строк. Осталось {final_rows_after_final_dropna} строк.")
+    #else:
+        #print(f"[{symbol}] INFO: DataFrame успешно обработан, содержит {final_rows_after_final_dropna} строк.")
+    
+    return df_copy
+
 
 def find_significant_levels(df, current_price, position_type, current_atr):
     """Ищет потенциальные уровни поддержки/сопротивления."""
@@ -536,54 +628,27 @@ def is_bollinger_bands_squeezing(df, current_bbw, bbw_ema):
     return current_bbw < bbw_ema * BBW_THRESHOLD_MULTIPLIER
 
 # --- Функция ML-фильтра ---
-def filter_signal(symbol: str, side: str, df_with_indicators: pd.DataFrame) -> float:
-    """
-    Применяет ML-модель для фильтрации сигнала.
-    Возвращает вероятность (prob) или 0.00, если фильтр отклонил сигнал.
-    """
-    global model, features # Доступ к глобальным переменным модели и признаков
+def filter_signal(candle_dict: dict) -> float:
+    # Убедитесь, что 'features' и 'model' доступны глобально
+    global features, model
 
     if model is None or features is None:
-        logger.info(f"[{symbol}] ML-модель не загружена. Пропускаю ML-фильтр.")
-        return 1.0 # Возвращаем 1.0, чтобы сигнал не был отклонен, если модель недоступна
+        logger.error("ML модель или список признаков не загружены.")
+        return 0.0 # Возвращаем 0, если модель не готова
 
-    if df_with_indicators.empty:
-        logger.warning(f"[{symbol}] Нет данных для ML-фильтра.")
-        return 0.0
+    feat_vector = []
+    for f in features:
+        if f not in candle_dict:
+            logger.warning(f"Отсутствует признак '{f}' для ML-модели. Возвращаю 0.00.")
+            return 0.0 # Если признак отсутствует, возвращаем 0
+        feat_vector.append(candle_dict[f])
 
-    # Извлекаем последнюю свечу для предсказания ИЗ ПОЛНОГО DATAFRAME
-    current_candle_data = df_with_indicators.iloc[[-1]]
+    # Используем predict_proba для получения вероятности класса 1 (прибыльной сделки)
+    prob = model.predict_proba([feat_vector])[:, 1][0]
+    return prob
 
-    # Создаем DataFrame для предсказания, гарантируя порядок и наличие всех признаков
-    X_predict = pd.DataFrame(index=current_candle_data.index)
-    
-    for f in features: # Итерируемся по признакам, которые ожидает модель
-        if f in current_candle_data.columns:
-            X_predict[f] = current_candle_data[f]
-        else:
-            # Если признак, который ожидает модель, отсутствует в текущих данных
-            logger.warning(f"[{symbol}] Отсутствует признак '{f}' для ML-модели. Возвращаю 0.00.")
-            return 0.0 # Отклоняем сигнал, если нужной фичи нет.
-            
-    # Проверка на NaN/inf в X_predict (может случиться, если индикаторы не вычислились)
-    if X_predict.isnull().any().any() or np.isinf(X_predict.values).any():
-        logger.warning(f"[{symbol}] Обнаружены NaN или Inf в признаках для ML-модели. Возвращаю 0.00.")
-        return 0.0 # Отклоняем сигнал в случае невалидных данных
-
-    try:
-        # Убедимся, что порядок колонок правильный перед предсказанием
-        # predict_proba возвращает вероятности для обоих классов [prob_class_0, prob_class_1]
-        # Нам нужна вероятность класса 1 (положительный сигнал)
-        prob = model.predict_proba(X_predict[features])[:, 1][0] 
-        return prob
-    except Exception as e:
-        logger.error(f"[{symbol}] Ошибка при предсказании ML-модели: {e}", exc_info=True)
-        return 0.0 # Отклоняем сигнал в случае ошибки
 
 def analyze_data(symbol, df):
-    if len(df) < 2:
-        logger.warning(f"[{symbol}] Недостаточно свечей ({len(df)}) для анализа после добавления индикаторов. Требуется минимум 2. Пропускаю анализ.")
-        return # Выходим из функции, если данных недостаточно 
     """Анализирует данные и, если сигнал достаточно сильный, открывает сделку."""
     last_candle = df.iloc[-1]
     prev_candle = df.iloc[-2]
@@ -593,15 +658,7 @@ def analyze_data(symbol, df):
     long_signal_reasons, short_signal_reasons = [], []
     signal_type_long, signal_type_short = "GENERIC_LONG", "GENERIC_SHORT" # Изменено для большей ясности
 
-    # --- Существующие индикаторы (ВАША ЛОГИКА) ---
-    # Убедитесь, что MACD_SUFFIX, KAMA_LENGTH, KAMA_FAST_EMA_PERIOD,
-    # KAMA_SLOW_EMA_PERIOD, BBW_EMA_LENGTH, VOLUME_CONFIRMATION_MULTIPLIER, CMF_LENGTH
-    # и другие константы определены глобально или передаются как аргументы.
-    # Также убедитесь, что функции типа is_bollinger_bands_squeezing,
-    # check_hammer_candlestick, check_engulfing_candlestick, calculate_dynamic_sl_tp, save_state
-    # доступны в этом файле.
-
-    # MACD
+    # --- Существующие индикаторы ---
     if (prev_candle[f'MACD{MACD_SUFFIX}'] < prev_candle[f'MACDs{MACD_SUFFIX}'] and last_candle[f'MACD{MACD_SUFFIX}'] > last_candle[f'MACDs{MACD_SUFFIX}']):
         long_score += 1
         long_signal_reasons.append("MACD кроссовер вверх")
@@ -609,7 +666,6 @@ def analyze_data(symbol, df):
         short_score += 1
         short_signal_reasons.append("MACD кроссовер вниз")
     
-    # RSI
     if (prev_candle['RSI_14'] < 30 and last_candle['RSI_14'] > 30):
         long_score += 1
         long_signal_reasons.append(f"RSI выход из перепроданности ({last_candle['RSI_14']:.2f})")
@@ -617,7 +673,7 @@ def analyze_data(symbol, df):
         short_score += 1
         short_signal_reasons.append(f"RSI выход из перекупленности ({last_candle['RSI_14']:.2f})")
     
-    # KAMA vs EMA
+    # Использование KAMA вместо EMA 50/200 для подтверждения тренда
     kama_col_name = f'KAMA_{KAMA_LENGTH}_{KAMA_FAST_EMA_PERIOD}_{KAMA_SLOW_EMA_PERIOD}'
     if kama_col_name in last_candle:
         # Проверка на восходящий тренд по KAMA
@@ -636,7 +692,6 @@ def analyze_data(symbol, df):
             short_score += 1
             short_signal_reasons.append("Сильный нисходящий тренд (EMA)")
 
-    # Bollinger Bands Width Squeeze
     bbw_col_name = 'BB_width' # Теперь используем переименованную колонку
     bbw_ema_col_name = f'BBW_EMA_{BBW_EMA_LENGTH}'
     if bbw_col_name in last_candle and bbw_ema_col_name in last_candle and is_bollinger_bands_squeezing(df, last_candle[bbw_col_name], last_candle[bbw_ema_col_name]):
@@ -645,14 +700,14 @@ def analyze_data(symbol, df):
         long_signal_reasons.append("BB Squeeze")
         short_signal_reasons.append("BB Squeeze")
     
-    # VOLUME_EMA
+    # VOLUME_EMA - теперь без суффикса, как в feature_engineering.py
     if last_candle['volume'] > (last_candle['VOLUME_EMA'] * VOLUME_CONFIRMATION_MULTIPLIER):
         long_score += 1
         short_score += 1
         long_signal_reasons.append("Повышенный объем")
         short_signal_reasons.append("Повышенный объем")
 
-    # --- НОВЫЕ ИНДИКАТОРЫ И ЛОГИКА (ВАША ЛОГИКА) ---
+    # --- НОВЫЕ ИНДИКАТОРЫ И ЛОГИКА ---
     # Chaikin Money Flow (CMF)
     cmf_col_name = f'CMF_{CMF_LENGTH}'
     if cmf_col_name in last_candle:
@@ -672,7 +727,7 @@ def analyze_data(symbol, df):
             short_score += 0.5
             short_signal_reasons.append(f"CMF (сильное давление продажи) ({last_candle[cmf_col_name]:.2f})")
     
-    # --- Свечные паттерны (ВАША ЛОГИКА) ---
+    # --- Свечные паттерны ---
     if current_close_price < last_candle['EMA_50']: # Паттерны для лонга чаще ищут на коррекции/падении
         if check_hammer_candlestick(df):
             long_score += 2
@@ -691,44 +746,33 @@ def analyze_data(symbol, df):
             
     # --- Открытие сделки ---
     if long_score >= MIN_SIGNAL_STRENGTH:
-        logger.info(f"[{symbol}] Расчетные очки: LONG={long_score} (Причины: {'; '.join(long_signal_reasons)}), SHORT={short_score} (Причины: {'; '.join(short_signal_reasons)})")
         # ▶ ML-фильтр
-        # ИСПРАВЛЕННЫЙ ВЫЗОВ ML-ФИЛЬТРА:
-        # Передаем filter_signal полный DataFrame 'df', а не только last_candle.to_dict()
-        # Это позволяет filter_signal получить все необходимые признаки, включая hour_of_day.
-        prob = filter_signal(symbol, "LONG", df) 
+        prob = filter_signal(last_candle.to_dict())
         if prob < FILTER_THRESHOLD:
-            logger.info(f"[{symbol}] ML-фильтр отклонил LONG (prob={prob:.2f} < {FILTER_THRESHOLD:.4f})")
-            logger.info(f"[{symbol}] Расчетные очки: LONG={long_score} (Причины: {'; '.join(long_signal_reasons)}), SHORT={short_score} (Причины: {'; '.join(short_signal_reasons)})")
+            logger.info(f"[{symbol}] ML-фильтр отклонил LONG (prob={prob:.2f} < {FILTER_THRESHOLD})")
             return
         
-        # --- Ваша логика открытия LONG сделки (остается неизменной) ---
         sl, tps = calculate_dynamic_sl_tp(current_close_price, df, "LONG", symbol, signal_type_long)
         active_trades[symbol] = {"type": "LONG", "entry_price": current_close_price, "sl": sl, "tp1": tps.get('TP1'), "tp2": tps.get('TP2'), "tp3": tps.get('TP3'), "status": "active"}
         logger.info(f"✅ [{symbol}] ОТКРЫТА LONG СДЕЛКА (Сила: {long_score}, ML-Prob: {prob:.2f}) @ {current_close_price:.8f}")
         logger.info(f"   SL: {sl:.8f}, TP1: {tps.get('TP1', 0.0):.8f}, TP2: {tps.get('TP2', 0.0):.8f}, TP3: {tps.get('TP3', 0.0):.8f}")
         logger.info(f"   Причины: {'; '.join(long_signal_reasons)}")
-        save_state(active_trades) # Здесь save_state() вызывается без аргументов, как в вашем коде,
-                     # если active_trades - глобальная переменная,
-                     # или save_state(active_trades), если она ожидает аргумент.
-        logger.info(f"[{symbol}] Расчетные очки: LONG={long_score} (Причины: {'; '.join(long_signal_reasons)}), SHORT={short_score} (Причины: {'; '.join(short_signal_reasons)})")
+        save_state(active_trades)
+
     elif short_score >= MIN_SIGNAL_STRENGTH:
-        logger.info(f"[{symbol}] Расчетные очки: LONG={long_score} (Причины: {'; '.join(long_signal_reasons)}), SHORT={short_score} (Причины: {'; '.join(short_signal_reasons)})")
         # ▶ ML-фильтр
-        # ИСПРАВЛЕННЫЙ ВЫЗОВ ML-ФИЛЬТРА:
-        # Передаем filter_signal полный DataFrame 'df', а не только last_candle.to_dict()
-        prob = filter_signal(symbol, "SHORT", df)
+        prob = filter_signal(last_candle.to_dict())
         if prob < FILTER_THRESHOLD:
-            logger.info(f"[{symbol}] ML-фильтр отклонил SHORT (prob={prob:.2f} < {FILTER_THRESHOLD:.4f})")
+            logger.info(f"[{symbol}] ML-фильтр отклонил SHORT (prob={prob:.2f} < {FILTER_THRESHOLD})")
             return
 
-        # --- Ваша логика открытия SHORT сделки (остается неизменной) ---
         sl, tps = calculate_dynamic_sl_tp(current_close_price, df, "SHORT", symbol, signal_type_short)
         active_trades[symbol] = {"type": "SHORT", "entry_price": current_close_price, "sl": sl, "tp1": tps.get('TP1'), "tp2": tps.get('TP2'), "tp3": tps.get('TP3'), "status": "active"}
         logger.info(f"✅ [{symbol}] ОТКРЫТА SHORT СДЕЛКА (Сила: {short_score}, ML-Prob: {prob:.2f}) @ {current_close_price:.8f}")
         logger.info(f"   SL: {sl:.8f}, TP1: {tps.get('TP1', 0.0):.8f}, TP2: {tps.get('TP2', 0.0):.8f}, TP3: {tps.get('TP3', 0.0):.8f}")
         logger.info(f"   Причины: {'; '.join(short_signal_reasons)}")
-        save_state(active_trades) # Здесь save_state() вызывается без аргументов, как в вашем коде.
+        save_state(active_trades)
+
 
 def monitor_trade(symbol, df):
     """Отслеживает активную сделку, проверяя достижение SL/TP."""
@@ -783,81 +827,48 @@ def monitor_trade(symbol, df):
 
 
 def initialize_bot():
-    global model, features, EXCHANGE # Объявляем глобальные переменные, с которыми будем работать
+    """Инициализирует бота: загружает конфиг, подключается к бирже, загружает состояние и модель."""
+    global EXCHANGE, model, features
     load_config()
     try:
-        # --- ВОТ ЧТО НЕ ХВАТАЛО! Инициализация EXCHANGE ---
-        EXCHANGE = ccxt.binance({
-            'rateLimit': 1200,
-            'enableRateLimit': True,
-            'options': {
-                'defaultType': 'future', # Это важно для торговли фьючерсами USDT-M
-            }
-        })
+        EXCHANGE = ccxt.binanceusdm({'options': {'defaultType': 'future', 'adjustForTimeDifference': True}})
         EXCHANGE.load_markets()
-        logger.info("✅ Биржа Binance USDT-M Futures успешно инициализирована.")
+        logger.info("Биржа Binance USDT-M Futures успешно инициализирована.")
     except Exception as e:
         logger.critical(f"Ошибка при инициализации биржи: {e}", exc_info=True)
-        exit() # Прерываем выполнение, если не удалось инициализировать биржу
-        
-    load_state() # Загружаем состояние активных сделок
-    
+        exit()
+    load_state()
     try:
-        model, features = load_latest_model() # Загружаем ML-модель
+        model, features = load_latest_model()
         logger.info("✅ ML-модель успешно загружена.")
-        if features:
-            logger.info(f"Модель ожидает следующие признаки: {features}")
     except Exception as e:
         logger.critical(f"❌ Ошибка при загрузке ML-модели: {e}. Бот не будет использовать ML-фильтр.", exc_info=True)
-        model = None # Сбрасываем модель и признаки, если загрузка не удалась
+        model = None
         features = None
 
 
 def main_loop():
     """Основной цикл работы бота."""
-    initialize_bot() # Здесь все еще должна быть ваша инициализация биржи и модели
+    initialize_bot()
     while True:
         logger.info(f"\n--- Новая итерация | Активных сделок: {len(active_trades)} ---")
-        
-        # ДОБАВЛЕНО: Проверка, что список символов не пуст
-        if not SYMBOLS:
-            logger.error("Список SYMBOLS пуст. Проверьте config.json на наличие символов и их корректную загрузку.")
-            time.sleep(MONITORING_INTERVAL_SECONDS)
-            continue
-
         for symbol in SYMBOLS:
-            #logger.info(f"[{symbol}] Начинаю обработку символа.") # Новый лог: начало обработки символа
-            
             df = fetch_data(symbol)
             if df is None or df.empty:
-                logger.warning(f"[{symbol}] Не удалось получить данные или DataFrame пуст после fetch_data.") # Новый лог: данные не получены
                 continue
-            
-            #logger.info(f"[{symbol}] Данные получены ({len(df)} свечей). Передаю для добавления индикаторов.") # Новый лог: данные получены
             df_with_indicators = add_indicators(df, symbol)
-            
             if df_with_indicators.empty:
-                logger.warning(f"[{symbol}] DataFrame пуст после добавления индикаторов.") # Новый лог: индикаторы не добавлены или очищены
                 continue
-            
-            #logger.info(f"[{symbol}] Индикаторы добавлены. Передаю для анализа.") # Новый лог: индикаторы успешно добавлены
             try:
                 if symbol in active_trades:
                     monitor_trade(symbol, df_with_indicators)
                 else:
                     analyze_data(symbol, df_with_indicators)
             except Exception as e:
-                logger.error(f"[{symbol}] Критическая ошибка при анализе/мониторинге: {e}", exc_info=True)
-            
-            # Важный момент: time.sleep(1) внутри цикла for symbol может сильно замедлять
-            # итерацию, если у вас много символов. Если вы хотите сделать паузу между запросами
-            # по каждому символу, 1 секунда может быть слишком много и приводить к RateLimit.
-            # Если у вас всего 1 символ, то это не проблема.
-            # Если символов много, рассмотрите удаление этого time.sleep(1) или его уменьшение.
-            # time.sleep(1) # Это пауза между обработкой символов.
-            
+                logger.error(f"[{symbol}] Критическая ошибка в главном цикле: {e}", exc_info=True)
+            time.sleep(1)
         logger.info(f"--- Итерация завершена. Следующая проверка через {MONITORING_INTERVAL_SECONDS} секунд. ---")
-        time.sleep(MONITORING_INTERVAL_SECONDS) # Основная пауза между итерациями
+        time.sleep(MONITORING_INTERVAL_SECONDS)
 
 
 if __name__ == "__main__":
